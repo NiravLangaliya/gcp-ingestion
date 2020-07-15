@@ -3,6 +3,7 @@ package com.mozilla.telemetry.ingestion.sink.config;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.BigQueryOptions;
+import com.google.cloud.pubsublite.Partition;
 import com.google.cloud.storage.Blob;
 import com.google.cloud.storage.Storage;
 import com.google.cloud.storage.StorageOptions;
@@ -13,22 +14,29 @@ import com.mozilla.telemetry.ingestion.core.transform.PubsubMessageToObjectNode;
 import com.mozilla.telemetry.ingestion.sink.io.BigQuery;
 import com.mozilla.telemetry.ingestion.sink.io.BigQuery.BigQueryErrors;
 import com.mozilla.telemetry.ingestion.sink.io.Gcs;
+import com.mozilla.telemetry.ingestion.sink.io.Input;
 import com.mozilla.telemetry.ingestion.sink.io.Pubsub;
+import com.mozilla.telemetry.ingestion.sink.io.PubsubLite;
 import com.mozilla.telemetry.ingestion.sink.transform.BlobIdToPubsubMessage;
 import com.mozilla.telemetry.ingestion.sink.transform.CompressPayload;
 import com.mozilla.telemetry.ingestion.sink.transform.DecompressPayload;
 import com.mozilla.telemetry.ingestion.sink.transform.DocumentTypePredicate;
 import com.mozilla.telemetry.ingestion.sink.transform.PubsubMessageToTemplatedString;
+import com.mozilla.telemetry.ingestion.sink.util.BatchException;
 import com.mozilla.telemetry.ingestion.sink.util.Env;
+import io.grpc.StatusException;
 import io.opencensus.exporter.stats.stackdriver.StackdriverStatsExporter;
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class SinkConfig {
 
@@ -37,11 +45,14 @@ public class SinkConfig {
   private static final String INPUT_COMPRESSION = "INPUT_COMPRESSION";
   private static final String INPUT_PARALLELISM = "INPUT_PARALLELISM";
   private static final String INPUT_SUBSCRIPTION = "INPUT_SUBSCRIPTION";
+  private static final String INPUT_PARTITIONS = "INPUT_PARTITIONS";
   private static final String BATCH_MAX_BYTES = "BATCH_MAX_BYTES";
   private static final String BATCH_MAX_DELAY = "BATCH_MAX_DELAY";
   private static final String BATCH_MAX_MESSAGES = "BATCH_MAX_MESSAGES";
   private static final String BIG_QUERY_OUTPUT_MODE = "BIG_QUERY_OUTPUT_MODE";
   private static final String BIG_QUERY_DEFAULT_PROJECT = "BIG_QUERY_DEFAULT_PROJECT";
+  private static final String DEAD_LETTER_TOPIC = "DEAD_LETTER_TOPIC";
+  private static final String DEAD_LETTER_AFTER_ATTEMPT = "DEAD_LETTER_AFTER_ATTEMPT";
   private static final String LOAD_MAX_BYTES = "LOAD_MAX_BYTES";
   private static final String LOAD_MAX_DELAY = "LOAD_MAX_DELAY";
   private static final String LOAD_MAX_FILES = "LOAD_MAX_FILES";
@@ -108,7 +119,7 @@ public class SinkConfig {
   private static final String DEFAULT_STREAMING_LOAD_MAX_DELAY = DEFAULT_STREAMING_BATCH_MAX_DELAY;
 
   @VisibleForTesting
-  protected static class Output implements Function<PubsubMessage, CompletableFuture<Void>> {
+  protected static class Output {
 
     private final Env env;
     private final OutputType type;
@@ -124,19 +135,10 @@ public class SinkConfig {
     public Output via(Function<PubsubMessage, CompletableFuture<Void>> write) {
       return new Output(this.env, this.type, write);
     }
-
-    public CompletableFuture<Void> apply(PubsubMessage message) {
-      return write.apply(message);
-    }
   }
 
   enum OutputType {
     pubsub {
-
-      private CompressPayload getOutputCompression(Env env) {
-        return CompressPayload.valueOf(
-            env.getString(OUTPUT_COMPRESSION, CompressPayload.NONE.toString()).toUpperCase());
-      }
 
       @Override
       Output getOutput(Env env, Executor executor) {
@@ -208,7 +210,8 @@ public class SinkConfig {
 
       @Override
       Output getOutput(Env env, Executor executor) {
-        Output pubsubWrite = pubsub.getOutput(env, executor);
+        Function<PubsubMessage, CompletableFuture<Void>> pubsubWrite = pubsub.getOutput(env,
+            executor).write;
         return new Output(env, this,
             new Gcs.Write.Ndjson(getGcsService(env),
                 env.getLong(BATCH_MAX_BYTES, DEFAULT_BATCH_MAX_BYTES),
@@ -247,9 +250,9 @@ public class SinkConfig {
         if (env.containsKey(OUTPUT_TOPIC)) {
           // BigQuery Load API limits maximum load requests per table per day to 1,000 so if
           // OUTPUT_TOPIC is present send blobInfo to pubsub and run load jobs separately
-          final Function<PubsubMessage, CompletableFuture<Void>> pubsubOutput = pubsub
-              .getOutput(env, executor);
-          bigQueryLoad = blob -> pubsubOutput.apply(BlobIdToPubsubMessage.encode(blob.getBlobId()));
+          final Function<PubsubMessage, CompletableFuture<Void>> pubsubWrite = pubsub.getOutput(env,
+              executor).write;
+          bigQueryLoad = blob -> pubsubWrite.apply(BlobIdToPubsubMessage.encode(blob.getBlobId()));
         } else {
           bigQueryLoad = new BigQuery.Load(bigQuery, storage,
               env.getLong(LOAD_MAX_BYTES, DEFAULT_LOAD_MAX_BYTES),
@@ -373,6 +376,11 @@ public class SinkConfig {
         .valueOf(env.getString(INPUT_COMPRESSION, DecompressPayload.NONE.name()).toUpperCase());
   }
 
+  private static CompressPayload getOutputCompression(Env env) {
+    return CompressPayload
+        .valueOf(env.getString(OUTPUT_COMPRESSION, CompressPayload.NONE.toString()).toUpperCase());
+  }
+
   private static String getGcsOutputBucket(Env env) {
     final String outputBucket = env.getString(OUTPUT_BUCKET);
     if (outputBucket.endsWith("/")) {
@@ -398,6 +406,50 @@ public class SinkConfig {
     return StorageOptions.getDefaultInstance().getService();
   }
 
+  private static class DeadLetterAfterAttempts
+      implements Function<PubsubMessage, CompletableFuture<Void>> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(DeadLetterAfterAttempts.class);
+    private final int attempts;
+    private final Function<PubsubMessage, CompletableFuture<Void>> deadLetter;
+    private final Function<PubsubMessage, CompletableFuture<Void>> write;
+
+    private DeadLetterAfterAttempts(int attempts,
+        Function<PubsubMessage, CompletableFuture<Void>> deadLetter,
+        Function<PubsubMessage, CompletableFuture<Void>> write) {
+      this.attempts = attempts;
+      this.deadLetter = deadLetter;
+      this.write = write;
+    }
+
+    @Override
+    public CompletableFuture<Void> apply(PubsubMessage input) {
+      return apply(input, attempts);
+    }
+
+    /** Attempt to write for a number of attempts, then fall back to deadLetter.
+     *
+     * <p>Always attempt to write at least once, and do not count BatchException against attempts.
+     */
+    private CompletableFuture<Void> apply(PubsubMessage input, int remainingAttempts) {
+      return CompletableFuture.completedFuture(input).thenCompose(write)
+          .thenApply(CompletableFuture::completedFuture).exceptionally(exception -> {
+            if (exception.getCause() instanceof BatchException) {
+              // only log batch exception once
+              ((BatchException) exception.getCause()).handle((batchExc) -> LOG.error(
+                  String.format("re-attempting to deliver %d messages", batchExc.size),
+                  batchExc.getCause()));
+              // retry batch failure indefinitely
+              return apply(input, remainingAttempts);
+            }
+            if (remainingAttempts > 1) {
+              return apply(input, remainingAttempts - 1);
+            }
+            return deadLetter.apply(input);
+          }).thenCompose(v -> v);
+    }
+  }
+
   /** Return a configured output transform. */
   public static Output getOutput() {
     Env env = new Env(INCLUDE_ENV_VARS);
@@ -407,30 +459,53 @@ public class SinkConfig {
     // that may be slow synchronous IO. As of 2020-04-25 there are 89 tables for telemetry and 118
     // tables for structured.
     Executor executor = new ForkJoinPool(env.getInt(OUTPUT_PARALLELISM, 150));
-    return OutputType.get(env).getOutput(env, executor);
+    Output output = OutputType.get(env).getOutput(env, executor);
+    if (env.containsKey(DEAD_LETTER_TOPIC)) {
+      // Attempt to write messages until they individually fail a number of attempts, then fall
+      // back to a dead letter queue. Use this to avoid negative acknowledgements for PubSub Lite.
+      final Function<PubsubMessage, CompletableFuture<Void>> deadLetter = new Pubsub.Write(
+          env.getString(OUTPUT_TOPIC), executor, b -> b, getOutputCompression(env))::withoutResult;
+      return output.via(new DeadLetterAfterAttempts(env.getInt(DEAD_LETTER_AFTER_ATTEMPT, 3),
+          deadLetter, output.write));
+    }
+    return output;
   }
 
   /** Return a configured input transform. */
-  public static Pubsub.Read getInput(Output output) throws IOException {
+  public static Input getInput(Output output) throws IOException, StatusException {
     // read pubsub messages from INPUT_SUBSCRIPTION
-    Pubsub.Read input = new Pubsub.Read(output.env.getString(INPUT_SUBSCRIPTION), output,
-        builder -> builder
-            .setFlowControlSettings(FlowControlSettings.newBuilder()
-                .setMaxOutstandingElementCount(
-                    output.type.getMaxOutstandingElementCount(output.env))
-                .setMaxOutstandingRequestBytes(
-                    output.type.getMaxOutstandingRequestBytes(output.env))
-                .build())
-            // The number of streaming subscriber connections for reading from Pub/Sub.
-            // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L141
-            // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L318-L320
-            // The default number of executor threads is max(6, 2*parallelPullCount).
-            // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L566-L568
-            // Subscriber connections are expected to be CPU bound until flow control thresholds are
-            // reached, so parallelism should be no less than the number of available processors.
-            .setParallelPullCount(
-                output.env.getInt(INPUT_PARALLELISM, Runtime.getRuntime().availableProcessors())),
-        getInputCompression(output.env));
+    final long bytesOutstanding = output.type.getMaxOutstandingRequestBytes(output.env);
+    final long messagesOutstanding = output.type.getMaxOutstandingElementCount(output.env);
+    DecompressPayload inputCompression = getInputCompression(output.env);
+    final Input input;
+    if (output.env.containsKey(INPUT_PARTITIONS)) {
+      com.google.cloud.pubsublite.cloudpubsub.FlowControlSettings flowControlSettings = //
+          com.google.cloud.pubsublite.cloudpubsub.FlowControlSettings.builder()
+              .setMessagesOutstanding(messagesOutstanding).setBytesOutstanding(bytesOutstanding)
+              .build();
+      List<Partition> partitions = output.env.getPartitions(INPUT_PARTITIONS);
+      input = new PubsubLite.Read(
+          output.env.getString(INPUT_SUBSCRIPTION), output.write, builder -> builder
+              .setPerPartitionFlowControlSettings(flowControlSettings).setPartitions(partitions),
+          inputCompression);
+    } else {
+      input = new Pubsub.Read(output.env.getString(INPUT_SUBSCRIPTION), output.write,
+          builder -> builder
+              .setFlowControlSettings(FlowControlSettings.newBuilder()
+                  .setMaxOutstandingElementCount(messagesOutstanding)
+                  .setMaxOutstandingRequestBytes(bytesOutstanding).build())
+              // The number of streaming subscriber connections for reading from Pub/Sub.
+              // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L141
+              // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L318-L320
+              // The default number of executor threads is max(6, 2*parallelPullCount).
+              // https://github.com/googleapis/java-pubsub/blob/v1.105.0/google-cloud-pubsub/src/main/java/com/google/cloud/pubsub/v1/Subscriber.java#L566-L568
+              // Subscriber connections are expected to be CPU bound until flow control thresholds
+              // are
+              // reached, so parallelism should be no less than the number of available processors.
+              .setParallelPullCount(
+                  output.env.getInt(INPUT_PARALLELISM, Runtime.getRuntime().availableProcessors())),
+          inputCompression);
+    }
     output.env.requireAllVarsUsed();
     // Setup OpenCensus stackdriver exporter after all measurement views have been registered,
     // as seen in https://opencensus.io/exporters/supported-exporters/java/stackdriver-stats/

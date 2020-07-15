@@ -10,7 +10,6 @@ import com.google.pubsub.v1.ProjectSubscriptionName;
 import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
 import com.mozilla.telemetry.ingestion.sink.transform.PubsubMessageToTemplatedString;
-import com.mozilla.telemetry.ingestion.sink.util.BatchException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.concurrent.CompletableFuture;
@@ -26,7 +25,7 @@ public class Pubsub {
   private Pubsub() {
   }
 
-  public static class Read {
+  public static class Read extends Input {
 
     private static final Logger LOG = LoggerFactory.getLogger(Read.class);
 
@@ -38,28 +37,8 @@ public class Pubsub {
         Function<Subscriber.Builder, Subscriber.Builder> config,
         Function<PubsubMessage, PubsubMessage> decompress) {
       ProjectSubscriptionName subscription = ProjectSubscriptionName.parse(subscriptionName);
-      subscriber = config.apply(Subscriber.newBuilder(subscription,
-          // Synchronous CompletableFuture methods are executed by the thread that completes the
-          // future, or the current thread if the future is already complete. Use that here to
-          // minimize memory usage by doing as much work as immediately possible.
-          (message, consumer) -> CompletableFuture.completedFuture(message).thenApply(decompress)
-              .thenCompose(output).whenComplete((result, exception) -> {
-                if (exception == null) {
-                  consumer.ack();
-                } else {
-                  // exception is always a CompletionException caused by another exception
-                  if (exception.getCause() instanceof BatchException) {
-                    // only log batch exception once
-                    ((BatchException) exception.getCause()).handle((batchExc) -> LOG.error(
-                        String.format("failed to deliver %d messages", batchExc.size),
-                        batchExc.getCause()));
-                  } else {
-                    // log exception specific to this message
-                    LOG.error("failed to deliver message", exception.getCause());
-                  }
-                  consumer.nack();
-                }
-              })))
+      subscriber = config
+          .apply(Subscriber.newBuilder(subscription, Input.getConsumer(LOG, decompress, output)))
           .build();
     }
 

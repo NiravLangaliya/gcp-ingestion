@@ -1,9 +1,12 @@
 package com.mozilla.telemetry.ingestion.sink.util;
 
+import com.google.cloud.pubsublite.Partition;
 import com.mozilla.telemetry.ingestion.core.util.Time;
+import io.grpc.StatusException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -63,6 +66,15 @@ public class Env {
 
   public Integer getInt(String key, Integer defaultValue) {
     return optString(key).map(Integer::new).orElse(defaultValue);
+  }
+
+  /** Get the value of an environment variable as a list of PubSub Lite partitions. */
+  public List<Partition> getPartitions(String key) throws StatusException {
+    List<Partition> partitions = new LinkedList<>();
+    for (String num : getString(key).split(",")) {
+      partitions.add(Partition.of(Long.parseLong(num)));
+    }
+    return partitions;
   }
 
   public Long getLong(String key, Long defaultValue) {

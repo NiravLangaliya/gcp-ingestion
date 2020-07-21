@@ -2,13 +2,17 @@
 
 from dataclasses import dataclass
 from functools import partial
+from typing import Dict, Optional, Tuple
+
 from google.cloud.pubsub_v1 import PublisherClient
 from persistqueue import SQLiteAckQueue
 from persistqueue.exceptions import Empty
 from sanic import Sanic
-from typing import Dict, Optional, Tuple
 import asyncio
 import uvloop
+
+from .publish import get_client_and_queue
+from .config import get_config_dict
 
 
 @dataclass
@@ -125,20 +129,44 @@ class Flush:
         while await self._flush():
             pass
 
+    async def run_until_complete(self):
+        """Call flush until queue is empty."""
+        while True:
+            try:
+                if await self._flush():
+                    break
+            except Exception:
+                pass  # ignore exceptions
 
-def init_app(app: Sanic, client: PublisherClient, q: SQLiteAckQueue):
-    """Initialize Sanic app with url rules."""
-    # configure Flush instance
-    flush = Flush(
+
+def get_flush(config: dict, client: PublisherClient, q: SQLiteAckQueue) -> Flush:
+    """Create a Flush instance."""
+    return Flush(
         client,
         q,
         **{
             key[6:].lower(): value
-            for key, value in app.config.items()
+            for key, value in config.items()
             if key.startswith("FLUSH_")
         }
     )
+
+
+def init_app(app: Sanic, client: PublisherClient, q: SQLiteAckQueue):
+    """Initialize Sanic app with url rules."""
+    flush = get_flush(app.config, client, q)
     # schedule periodic flush in background on app start
     app.listener("before_server_start")(flush.before_server_start)
     # schedule flush on shutdown
     app.listener("after_server_stop")(flush.after_server_stop)
+
+
+def main():
+    """Flush until queue is empty."""
+    config = get_config_dict()
+    flush = get_flush(config, *get_client_and_queue(config))
+    asyncio.run_until_complete(flush.run_until_complete())
+
+
+if __name__ == "__main__":
+    main()

@@ -79,10 +79,10 @@ async def submit(
     return response.text("")
 
 
-def init_app(app: Sanic) -> Tuple[PublisherClient, SQLiteAckQueue]:
-    """Initialize Sanic app with url rules."""
+def get_client_and_queue(config: dict) -> Tuple[PublisherClient, SQLiteAckQueue]:
+    """Create a pubsub client and a queue."""
     # Initialize PubSub client
-    timeout = app.config.get("PUBLISH_TIMEOUT_SECONDS", None)
+    timeout = config.get("PUBLISH_TIMEOUT_SECONDS", None)
     client = PublisherClient()
     client.api.publish = partial(
         client.api.publish,
@@ -96,10 +96,15 @@ def init_app(app: Sanic) -> Tuple[PublisherClient, SQLiteAckQueue]:
     # * SQLite provides thread-safe and process-safe access
     queue_config = {
         key[6:].lower(): value
-        for key, value in app.config.items()
+        for key, value in config.items()
         if key.startswith("QUEUE_")
     }
-    q = SQLiteAckQueue(**queue_config)
+    return client, SQLiteAckQueue(**queue_config)
+
+
+def init_app(app: Sanic) -> Tuple[PublisherClient, SQLiteAckQueue]:
+    """Initialize Sanic app with url rules."""
+    client, q = get_client_and_queue(app.config)
     # get metadata_headers config
     metadata_headers = app.config["METADATA_HEADERS"]
     # validate attribute keys
